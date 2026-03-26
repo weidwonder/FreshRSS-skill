@@ -2,35 +2,42 @@
 
 **[中文版本 / Chinese Version](README_zh.md)**
 
-A Claude Code skill that connects your AI assistant to your self-hosted [FreshRSS](https://freshrss.org/) instance, enabling natural language interaction with your RSS feeds and articles.
+A Claude Code skill that connects your AI assistant to a self-hosted [FreshRSS](https://freshrss.org/) instance through the FreshRSS API, so you can browse feeds and manage articles in natural language.
 
 ## What It Does
 
-This skill gives Claude Code direct access to your FreshRSS RSS reader. Instead of switching between your terminal and a browser, you can manage your RSS subscriptions conversationally:
+This skill gives Claude Code direct access to your FreshRSS reader without relying on fragile web-page parsing:
 
-- **List feeds** — see all subscribed feeds with unread counts
-- **Browse articles** — filter by feed, read status, or count
-- **Read full content** — fetch complete article text without leaving the terminal
-- **Manage read status** — mark articles as read or unread in batch
-- **Star articles** — bookmark important articles for later
+- **List feeds** — show subscribed feeds with unread counts
+- **Browse articles** — filter by feed, unread status, or count
+- **Read full content** — fetch a specific article by ID from the API
+- **Manage read state** — mark entries read or unread in batch
+- **Star articles** — toggle the FreshRSS starred state
 
-## Why Use This Skill
+## Why This Version Is Better
 
-### Natural Language RSS Management
+### API-first and reliable
 
-Ask Claude things like "show me unread articles from my tech feeds" or "what's new today?" — no need to remember CLI flags or navigate a web UI.
+The skill now uses FreshRSS's Google Reader compatible API instead of HTML parsing and browser-session tricks. That makes login, listing, and state changes much more stable.
 
-### Stays in Your Workflow
+### Keeps the CLI stable
 
-If you already work in the terminal with Claude Code, this skill keeps your news reading in the same context. Read an article, discuss it with Claude, and continue coding — all in one session.
+Existing commands are preserved:
 
-### Self-Hosted & Private
+- `list-feeds`
+- `get-articles [--feed-id ID] [--count N] [--unread]`
+- `get-content <article_id>`
+- `mark-read <ids>`
+- `mark-unread <ids>`
+- `toggle-star <article_id>`
+- `unread-count`
 
-Connects to your own FreshRSS instance. Your credentials stay local in a `.env` file. No third-party services involved beyond your own server.
+### Flexible deployment
 
-### Smart Workflows
+You can point the skill at either:
 
-Claude can chain commands intelligently: check unread counts, fetch interesting articles, read the full content, then mark them as read — all from a single conversation.
+- `FRESHRSS_URL` — the FreshRSS base URL, and the client derives `/api/greader.php`
+- `FRESHRSS_API_URL` — the exact Google Reader API endpoint, useful when the API is exposed via another host or reverse proxy
 
 ## Quick Start
 
@@ -46,16 +53,32 @@ python3 -m venv .venv
 
 ```bash
 cp .env.example .env
-# Edit .env with your FreshRSS URL, username, and password
+```
+
+Recommended `.env`:
+
+```dotenv
+FRESHRSS_URL=http://your-freshrss-host:1201
+FRESHRSS_API_URL=http://your-freshrss-host:1201/api/greader.php
+FRESHRSS_USERNAME=your-username
+FRESHRSS_API_PASSWORD=your-api-password
+```
+
+Compatibility fallback is still supported:
+
+```dotenv
+FRESHRSS_PASSWORD=your-password
 ```
 
 3. **Verify**
 
 ```bash
 .venv/bin/python freshrss_cli.py list-feeds
+.venv/bin/python freshrss_cli.py unread-count
+.venv/bin/python freshrss_cli.py get-articles --unread --count 3
 ```
 
-See [references/setup.md](freshrss/references/setup.md) for detailed setup instructions.
+See [references/setup.md](freshrss/references/setup.md) for setup details.
 
 ## Available Commands
 
@@ -63,23 +86,41 @@ See [references/setup.md](freshrss/references/setup.md) for detailed setup instr
 |---------|-------------|
 | `list-feeds` | List all subscribed feeds with IDs and unread counts |
 | `get-articles [--feed-id ID] [--count N] [--unread]` | Get article list with filters |
-| `get-content <article_id>` | Get full article content |
+| `get-content <article_id>` | Fetch a specific article by ID |
 | `mark-read <ids>` | Mark articles as read (comma-separated IDs) |
 | `mark-unread <ids>` | Mark articles as unread (comma-separated IDs) |
 | `toggle-star <article_id>` | Toggle star/bookmark on an article |
 | `unread-count` | Get unread counts per feed |
 
-## Example Workflows
+## Notes About Article IDs
 
-**Morning news check:**
-> "How many unread articles do I have?" → "Show me the latest 5 from my tech feeds" → "Read the one about Rust" → "Mark them all as read"
+The API returns Google Reader item IDs. The CLI displays the short item ID suffix, and commands accept either:
 
-**Research bookmark:**
-> "Find articles about LLMs in my feeds" → "Star the most relevant ones"
+- short form like `00064dec964114be`
+- full form like `tag:google.com,2005:reader/item/00064dec964114be`
+
+## Lightweight Verification
+
+To quickly verify unread state consistency:
+
+```bash
+.venv/bin/python freshrss_cli.py unread-count
+.venv/bin/python freshrss_cli.py get-articles --unread --count 5
+```
+
+If `unread-count` shows unread items for a feed, `get-articles --unread` should return entries whose status is shown as `[unread]`.
+
+A simple round-trip check for one article is:
+
+```bash
+.venv/bin/python freshrss_cli.py mark-read <article_id>
+.venv/bin/python freshrss_cli.py mark-unread <article_id>
+```
 
 ## Technical Details
 
-- Authenticates via FreshRSS's bcrypt challenge mechanism (web session)
-- Parses FreshRSS HTML responses directly — no API extension required
-- Auto-retries on connection errors with re-authentication
-- Dependencies: `requests`, `bcrypt`, `python-dotenv`
+- Uses the FreshRSS Google Reader compatible API at `/api/greader.php`
+- Authenticates with `accounts/ClientLogin`
+- Uses `/reader/api/0/token` + `/reader/api/0/edit-tag` for read/unread/star changes
+- Converts article HTML snippets to readable text only after the API returns structured item data
+- Dependencies: `requests`, `python-dotenv`

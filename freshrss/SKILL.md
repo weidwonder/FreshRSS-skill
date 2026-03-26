@@ -1,10 +1,10 @@
 ---
 name: freshrss
 description: >
-  Interact with a FreshRSS RSS reader instance - list feeds, read articles,
-  mark read/unread, star articles, get unread counts. Use when the user mentions
-  RSS, news feeds, FreshRSS, reading articles, checking unread items, or managing
-  RSS subscriptions.
+  Interact with a FreshRSS RSS reader instance through the FreshRSS API - list
+  feeds, read articles, mark read/unread, star articles, and get unread counts.
+  Use when the user mentions RSS, news feeds, FreshRSS, reading articles,
+  checking unread items, or managing RSS subscriptions.
 ---
 
 # FreshRSS
@@ -31,6 +31,25 @@ Where `<skill_dir>` is the directory containing this SKILL.md.
 | `toggle-star <article_id>` | Toggle star/bookmark |
 | `unread-count` | Get unread counts per feed |
 
+## Configuration
+
+Recommended environment variables in `scripts/.env`:
+
+```dotenv
+FRESHRSS_URL=http://your-freshrss-host:1201
+FRESHRSS_API_URL=http://your-freshrss-host:1201/api/greader.php
+FRESHRSS_USERNAME=your-username
+FRESHRSS_API_PASSWORD=your-api-password
+```
+
+Compatibility fallback:
+
+```dotenv
+FRESHRSS_PASSWORD=your-password
+```
+
+The CLI accepts either `FRESHRSS_URL` or `FRESHRSS_API_URL`. If both are set, `FRESHRSS_API_URL` wins.
+
 ## Examples
 
 ```bash
@@ -40,11 +59,11 @@ Where `<skill_dir>` is the directory containing this SKILL.md.
 # Get 10 unread articles from feed 3
 <skill_dir>/scripts/.venv/bin/python <skill_dir>/scripts/freshrss_cli.py get-articles --feed-id 3 --count 10 --unread
 
-# Read full article
-<skill_dir>/scripts/.venv/bin/python <skill_dir>/scripts/freshrss_cli.py get-content 123456
+# Read a full article by short item ID
+<skill_dir>/scripts/.venv/bin/python <skill_dir>/scripts/freshrss_cli.py get-content 00064dec964114be
 
 # Mark articles as read
-<skill_dir>/scripts/.venv/bin/python <skill_dir>/scripts/freshrss_cli.py mark-read 123456,789012
+<skill_dir>/scripts/.venv/bin/python <skill_dir>/scripts/freshrss_cli.py mark-read 00064dec964114be,00064dd80d49a44e
 ```
 
 ## Typical Workflows
@@ -55,4 +74,4 @@ Where `<skill_dir>` is the directory containing this SKILL.md.
 
 ## Error Handling
 
-If a command fails with missing credentials or authentication errors, the CLI prints an error with a path to `references/setup.md`. Follow that guide to configure the skill.
+If a command fails with missing credentials or authentication errors, the CLI prints an error with a path to `references/setup.md`. Follow that guide to configure the FreshRSS API endpoint and credentials.

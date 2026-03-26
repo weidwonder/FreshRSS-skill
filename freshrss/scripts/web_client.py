@@ -1,15 +1,24 @@
-"""FreshRSS Web Session Client - uses bcrypt challenge auth and HTML parsing."""
+"""基于 FreshRSS Google Reader API 的客户端。"""
 
-import re
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
+from html import unescape
+from html.parser import HTMLParser
+from typing import Dict, List, Optional
+from urllib.parse import quote
 
-import bcrypt
 import requests
 
 logger = logging.getLogger(__name__)
+
+READING_LIST_STREAM = "user/-/state/com.google/reading-list"
+READ_TAG = "user/-/state/com.google/read"
+STARRED_TAG = "user/-/state/com.google/starred"
+LABEL_PREFIX = "user/-/label/"
+ITEM_ID_PREFIX = "tag:google.com,2005:reader/item/"
 
 
 class FreshRSSError(Exception):
@@ -44,229 +53,354 @@ class Article:
     tags: List[str] = field(default_factory=list)
 
 
-class FreshRSSWebClient:
-    """Authenticates via bcrypt challenge and interacts with FreshRSS via HTML parsing."""
+class _HTMLTextExtractor(HTMLParser):
+    _BLOCK_TAGS = {
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "div",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tr",
+        "ul",
+    }
 
-    def __init__(self, base_url: str, username: str, password: str):
-        self.base_url = base_url.rstrip("/")
-        self.freshrss_url = f"{self.base_url}/i"
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in self._BLOCK_TAGS:
+            self._append_break()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._BLOCK_TAGS:
+            self._append_break()
+
+    def handle_data(self, data: str) -> None:
+        text = data.strip()
+        if not text:
+            return
+        if self._parts and not self._parts[-1].endswith(("\n", " ")):
+            self._parts.append(" ")
+        self._parts.append(text)
+
+    def text(self) -> str:
+        joined = "".join(self._parts)
+        lines = [line.strip() for line in joined.splitlines()]
+        return "\n".join(line for line in lines if line)
+
+    def _append_break(self) -> None:
+        if self._parts and self._parts[-1] != "\n":
+            self._parts.append("\n")
+
+
+class FreshRSSWebClient:
+    """通过 Google Reader 兼容 API 访问 FreshRSS。"""
+
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        api_url: Optional[str] = None,
+    ):
+        self.base_url = (base_url or "").rstrip("/")
+        self.api_url = self._build_api_url(self.base_url, api_url)
         self.username = username
         self.password = password
-        self._session: Optional[requests.Session] = None
-        self._rid: Optional[str] = None
-        self._csrf: Optional[str] = None
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "User-Agent": "FreshRSS-CLI/2.0",
+                "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
+            }
+        )
+        self._auth_token: Optional[str] = None
+        self._edit_token: Optional[str] = None
 
-    def _new_session(self) -> requests.Session:
-        s = requests.Session()
-        s.headers["User-Agent"] = "Mozilla/5.0 FreshRSS-MCP/1.0"
-        s.headers["Connection"] = "close"  # Avoid keep-alive reuse issues
-        return s
+    @staticmethod
+    def _build_api_url(base_url: str, api_url: Optional[str]) -> str:
+        candidate = (api_url or base_url or "").rstrip("/")
+        if not candidate:
+            raise FreshRSSError(
+                "缺少 FreshRSS 地址，请配置 FRESHRSS_API_URL 或 FRESHRSS_URL。"
+            )
+        if candidate.endswith("/api/greader.php"):
+            return candidate
+        if candidate.endswith("/api"):
+            return f"{candidate}/greader.php"
+        return f"{candidate}/api/greader.php"
 
-    def _get(self, path: str, retries: int = 2, **kwargs) -> requests.Response:
-        url = f"{self.freshrss_url}/{path}"
-        last_err = None
-        for attempt in range(retries + 1):
-            try:
-                return self._session.get(url, timeout=20, **kwargs)
-            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
-                last_err = e
-                if attempt < retries:
-                    # Re-authenticate on connection reset
-                    logger.warning(f"Connection error (attempt {attempt+1}), retrying... {e}")
-                    self.authenticate()
-        raise last_err
+    @staticmethod
+    def _parse_key_value_response(body: str) -> Dict[str, str]:
+        values: Dict[str, str] = {}
+        for line in body.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+        return values
 
-    def _get_csrf(self, body: str) -> str:
-        m = re.search(r'"csrf":"([a-f0-9]+)"', body)
-        return m.group(1) if m else ""
+    @staticmethod
+    def _normalize_feed_stream(feed_id: Optional[str]) -> str:
+        if not feed_id:
+            return READING_LIST_STREAM
+        return feed_id if feed_id.startswith("feed/") else f"feed/{feed_id}"
+
+    @staticmethod
+    def _normalize_article_id(article_id: str) -> str:
+        article_id = article_id.strip()
+        if article_id.startswith(ITEM_ID_PREFIX):
+            return article_id
+        if "/reader/item/" in article_id:
+            return article_id
+        return f"{ITEM_ID_PREFIX}{article_id}"
+
+    @staticmethod
+    def _short_article_id(article_id: str) -> str:
+        return article_id.rsplit("/", 1)[-1]
+
+    @staticmethod
+    def _strip_html(value: str) -> str:
+        if not value:
+            return ""
+        parser = _HTMLTextExtractor()
+        parser.feed(unescape(value))
+        parser.close()
+        return parser.text()
+
+    @staticmethod
+    def _iso_datetime(timestamp: Optional[int]) -> str:
+        if not timestamp:
+            return ""
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[dict] = None,
+        data: Optional[dict] = None,
+        require_auth: bool = True,
+        timeout: int = 20,
+    ) -> requests.Response:
+        headers = {}
+        if require_auth:
+            self._ensure_auth()
+            headers["Authorization"] = f"GoogleLogin auth={self._auth_token}"
+
+        url = f"{self.api_url}{path}"
+        try:
+            response = self._session.request(
+                method=method,
+                url=url,
+                params=params,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            raise FreshRSSError(f"请求 FreshRSS API 失败：{exc}") from exc
+
+        if response.status_code in (401, 403):
+            self._auth_token = None
+            self._edit_token = None
+            details = response.text.strip() or "未提供错误详情"
+            raise AuthenticationError(
+                "FreshRSS API 认证失败。"
+                "请确认 API 已启用，并优先使用 FreshRSS 的 API 密码"
+                f"（当前接口：{self.api_url}，详情：{details}）。"
+            )
+
+        if response.status_code == 404:
+            raise FreshRSSError(
+                f"FreshRSS API 地址不可用：{url}。"
+                "请检查 FRESHRSS_API_URL 或 FRESHRSS_URL 是否正确。"
+            )
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            details = response.text.strip()
+            raise FreshRSSError(
+                f"FreshRSS API 请求失败：HTTP {response.status_code} {details}"
+            ) from exc
+
+        return response
+
+    def _request_json(self, method: str, path: str, **kwargs) -> dict:
+        response = self._request(method, path, **kwargs)
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise FreshRSSError(
+                f"FreshRSS API 返回了无法解析的 JSON：{response.text[:200]}"
+            ) from exc
 
     def authenticate(self) -> bool:
-        """Login via bcrypt challenge mechanism."""
-        session = self._new_session()
-        try:
-            # Step 1: Get nonce and salt1 for this user
-            resp = session.get(
-                f"{self.freshrss_url}/?c=javascript&a=nonce&user={self.username}",
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if "salt1" not in data or "nonce" not in data:
-                raise AuthenticationError(f"User '{self.username}' not found")
-
-            # Step 2: Compute bcrypt challenge
-            salt1 = data["salt1"].encode()
-            nonce = data["nonce"]
-            s_hash = bcrypt.hashpw(self.password.encode(), salt1).decode()
-            combined = (nonce + s_hash).encode()[:72]
-            challenge = bcrypt.hashpw(combined, bcrypt.gensalt(rounds=4)).decode()
-
-            # Step 3: Get CSRF token from login page
-            login_page = session.get(
-                f"{self.freshrss_url}/?c=auth&a=login", timeout=10
-            )
-            csrf = self._get_csrf(login_page.text)
-            orig = re.search(r'name="original_request" value="([^"]+)"', login_page.text)
-
-            # Step 4: Submit login form
-            login_resp = session.post(
-                f"{self.freshrss_url}/?c=auth&a=login",
-                data={
-                    "_csrf": csrf,
-                    "username": self.username,
-                    "challenge": challenge,
-                    "original_request": orig.group(1) if orig else "",
-                },
-                timeout=10,
+        if not self.username or not self.password:
+            raise AuthenticationError(
+                "缺少 FreshRSS 用户名或密码，请配置 FRESHRSS_USERNAME 和 "
+                "FRESHRSS_API_PASSWORD（或兼容使用 FRESHRSS_PASSWORD）。"
             )
 
-            # Extract rid from redirect URL
-            rid_match = re.search(r"rid=([a-f0-9]+)", login_resp.url)
-            if not rid_match:
-                raise AuthenticationError("Login failed - no rid in response URL")
+        response = self._request(
+            "POST",
+            "/accounts/ClientLogin",
+            data={"Email": self.username, "Passwd": self.password},
+            require_auth=False,
+            timeout=10,
+        )
+        values = self._parse_key_value_response(response.text)
+        auth_token = values.get("Auth")
+        if not auth_token:
+            error_code = values.get("Error") or response.text.strip() or "未知错误"
+            raise AuthenticationError(
+                "FreshRSS Google Reader API 登录失败。"
+                f"返回信息：{error_code}。"
+                "请检查用户名/密码，若已启用 API 密码，请使用 FRESHRSS_API_PASSWORD。"
+            )
 
-            self._session = session
-            self._rid = rid_match.group(1)
-            # Refresh CSRF for subsequent requests
-            self._csrf = self._get_csrf(login_resp.text)
-            logger.info(f"Authenticated as '{self.username}', rid={self._rid}")
-            return True
+        self._auth_token = auth_token
+        self._edit_token = None
+        logger.info("已通过 Google Reader API 登录 FreshRSS：%s", self.username)
+        return True
 
-        except AuthenticationError:
-            raise
-        except Exception as e:
-            raise AuthenticationError(f"Authentication failed: {e}") from e
-
-    def _ensure_auth(self):
-        if self._session is None or self._rid is None:
+    def _ensure_auth(self) -> None:
+        if not self._auth_token:
             self.authenticate()
 
-    def _refresh_csrf(self):
-        """Re-fetch CSRF from main page."""
-        r = self._get(f"?rid={self._rid}")
-        self._csrf = self._get_csrf(r.text)
+    def _get_edit_token(self) -> str:
+        if not self._edit_token:
+            response = self._request("GET", "/reader/api/0/token")
+            token = response.text.strip()
+            if not token:
+                raise FreshRSSError("无法获取 FreshRSS 编辑令牌。")
+            self._edit_token = token
+        return self._edit_token
 
-    def get_feeds(self) -> List[Feed]:
-        """Get list of subscribed feeds from sidebar HTML."""
-        self._ensure_auth()
-        r = self._get(f"?rid={self._rid}")
-        body = r.text
+    def _get_item_categories(self, article_id: str) -> List[str]:
+        article = self.get_article(article_id)
+        categories = [READING_LIST_STREAM]
+        categories.extend(f"{LABEL_PREFIX}{tag}" for tag in article.tags)
+        if article.is_read:
+            categories.append(READ_TAG)
+        if article.is_starred:
+            categories.append(STARRED_TAG)
+        return categories
 
-        feeds = []
-        # Parse feed entries from sidebar: data-feed="ID" with feed name
-        # FreshRSS sidebar uses: ?get=f_ID links with feed names
-        for m in re.finditer(
-            r'href="[^"]*[?&]get=f_(\d+)[^"]*"[^>]*>\s*'
-            r'(?:<img[^>]*>\s*)?<span[^>]*class="[^"]*nav-site-title[^"]*"[^>]*>([^<]+)</span>',
-            body,
-        ):
-            feeds.append(Feed(id=m.group(1), name=m.group(2).strip()))
+    def _parse_article(self, item: dict) -> Article:
+        categories = item.get("categories") or []
+        origin = item.get("origin") or {}
+        feed_stream_id = origin.get("streamId", "")
+        summary_html = (item.get("summary") or {}).get("content", "")
+        content_html = (item.get("content") or {}).get("content", summary_html)
+        url = ""
+        alternates = item.get("alternate") or item.get("canonical") or []
+        if alternates:
+            url = alternates[0].get("href", "")
 
-        if not feeds:
-            # Fallback: parse from data-feed attributes
-            feed_ids = set(re.findall(r'data-feed="(\d+)"', body))
-            feed_names = {}
-            for m in re.finditer(
-                r'data-feed="(\d+)".*?data-website-name="([^"]*)"', body, re.DOTALL
-            ):
-                feed_names[m.group(1)] = m.group(2)
-            for fid in sorted(feed_ids):
-                feeds.append(Feed(id=fid, name=feed_names.get(fid, f"Feed {fid}")))
+        authors = item.get("author") or ""
+        if isinstance(authors, list):
+            authors = ", ".join(str(author) for author in authors if author)
 
-        # Get unread counts from sidebar
-        for m in re.finditer(
-            r'data-id="(\d+)"[^>]*>\s*<span[^>]*>(\d+)</span>', body
-        ):
-            for feed in feeds:
-                if feed.id == m.group(1):
-                    feed.unread_count = int(m.group(2))
+        tags = [tag[len(LABEL_PREFIX) :] for tag in categories if tag.startswith(LABEL_PREFIX)]
 
-        return feeds
-
-    def _parse_articles(self, body: str) -> List[Article]:
-        """Parse article list from FreshRSS HTML page."""
-        articles = []
-
-        # Find all flux divs: <div class="flux [not_read]" data-entry="ID" data-feed="FID" ...>
-        flux_blocks = re.finditer(
-            r'<div class="flux([^"]*?)"[^>]*data-entry="(\d+)"[^>]*data-feed="(\d+)"[^>]*>(.*?)'
-            r'(?=<div class="flux|<div id="new-article"|</main>)',
-            body,
-            re.DOTALL,
+        return Article(
+            id=self._short_article_id(item.get("id", "")),
+            feed_id=feed_stream_id.split("/", 1)[-1] if feed_stream_id.startswith("feed/") else feed_stream_id,
+            feed_name=origin.get("title", ""),
+            title=item.get("title", "") or "(untitled)",
+            url=url,
+            summary=self._strip_html(summary_html),
+            content=self._strip_html(content_html),
+            authors=authors,
+            date=self._iso_datetime(item.get("published")),
+            is_read=READ_TAG in categories,
+            is_starred=STARRED_TAG in categories,
+            tags=tags,
         )
 
-        for block in flux_blocks:
-            classes = block.group(1)
-            entry_id = block.group(2)
-            feed_id = block.group(3)
-            content = block.group(4)
+    def _fetch_stream_items(
+        self,
+        stream_id: str,
+        *,
+        count: int,
+        unread_only: bool,
+    ) -> List[dict]:
+        items: List[dict] = []
+        continuation: Optional[str] = None
+        encoded_stream_id = quote(stream_id, safe="/-.:")
 
-            is_read = "not_read" not in classes
-            is_starred = "favorite" in classes or "starred" in classes
+        while len(items) < count:
+            remaining = max(count - len(items), 1)
+            params = {"n": min(remaining, 1000), "output": "json"}
+            if unread_only:
+                params["xt"] = READ_TAG
+            if continuation:
+                params["c"] = continuation
 
-            # Feed name
-            feed_name_m = re.search(r'data-website-name="([^"]*)"', content)
-            feed_name = feed_name_m.group(1) if feed_name_m else ""
+            payload = self._request_json(
+                "GET",
+                f"/reader/api/0/stream/contents/{encoded_stream_id}",
+                params=params,
+            )
+            batch = payload.get("items") or []
+            items.extend(batch)
+            continuation = payload.get("continuation")
+            if not continuation or not batch:
+                break
 
-            # Authors
-            authors_m = re.search(r'data-article-authors="([^"]*)"', content)
-            authors = authors_m.group(1) if authors_m else ""
+        return items[:count]
 
-            # Title and URL - attribute order may vary, extract independently
-            title_anchor = re.search(r'<a[^>]*class="[^"]*item-element title[^"]*"[^>]*>(.*?)</a>', content, re.DOTALL)
-            if title_anchor:
-                title = re.sub(r"<[^>]+>", "", title_anchor.group(1)).strip()
-                url_m = re.search(r'href="([^"]*)"', title_anchor.group(0))
-                url = url_m.group(1) if url_m else ""
-            else:
-                title = ""
-                url = ""
+    def get_feeds(self) -> List[Feed]:
+        subscriptions = self._request_json(
+            "GET", "/reader/api/0/subscription/list", params={"output": "json"}
+        )
+        unread_payload = self._request_json(
+            "GET", "/reader/api/0/unread-count", params={"output": "json"}
+        )
 
-            # Date
-            date_m = re.search(r'<time[^>]+datetime="([^"]+)"', content)
-            date_str = date_m.group(1) if date_m else ""
+        unread_by_feed: Dict[str, int] = {}
+        for entry in unread_payload.get("unreadcounts") or []:
+            raw_id = entry.get("id", "")
+            if raw_id.startswith("feed/"):
+                unread_by_feed[raw_id.split("/", 1)[1]] = int(entry.get("count", 0))
 
-            # Summary
-            summary_m = re.search(r'<div class="summary">([^<]*)</div>', content)
-            summary = summary_m.group(1).strip() if summary_m else ""
-
-            # Full content text (strip HTML tags)
-            text_m = re.search(r'<div class="text">(.*?)</div>\s*</div>', content, re.DOTALL)
-            if text_m:
-                raw = text_m.group(1)
-                content_text = re.sub(r"<[^>]+>", " ", raw)
-                content_text = re.sub(r"\s+", " ", content_text).strip()
-            else:
-                content_text = summary
-
-            # Tags
-            tags = re.findall(r'<a class="link-tag"[^>]*>#(\w+)</a>', content)
-
-            # Check if starred via icon
-            bookmark_m = re.search(r'<a[^>]*class="[^"]*bookmark[^"]*"[^>]*>', content)
-            if bookmark_m:
-                is_starred = "non-starred" not in content[
-                    bookmark_m.start() : bookmark_m.start() + 200
-                ]
-
-            articles.append(
-                Article(
-                    id=entry_id,
-                    feed_id=feed_id,
-                    feed_name=feed_name,
-                    title=title,
-                    url=url,
-                    summary=summary,
-                    content=content_text,
-                    authors=authors,
-                    date=date_str,
-                    is_read=is_read,
-                    is_starred=is_starred,
-                    tags=tags,
+        feeds: List[Feed] = []
+        for subscription in subscriptions.get("subscriptions") or []:
+            raw_id = subscription.get("id", "")
+            feed_id = raw_id.split("/", 1)[1] if raw_id.startswith("feed/") else raw_id
+            feed_url = subscription.get("htmlUrl") or subscription.get("url") or ""
+            feeds.append(
+                Feed(
+                    id=feed_id,
+                    name=subscription.get("title", f"Feed {feed_id}"),
+                    url=feed_url,
+                    unread_count=unread_by_feed.get(feed_id, 0),
                 )
             )
 
-        return articles
+        return feeds
 
     def get_articles(
         self,
@@ -274,40 +408,52 @@ class FreshRSSWebClient:
         count: int = 20,
         unread_only: bool = False,
     ) -> List[Article]:
-        """Get articles, optionally filtered by feed."""
-        self._ensure_auth()
+        stream_id = self._normalize_feed_stream(feed_id)
+        items = self._fetch_stream_items(
+            stream_id,
+            count=max(count, 1),
+            unread_only=unread_only,
+        )
+        return [self._parse_article(item) for item in items]
 
-        params = f"nb={min(count, 200)}&rid={self._rid}"
-        if feed_id:
-            params += f"&f={feed_id}"
+    def get_article(self, article_id: str) -> Article:
+        payload = self._request_json(
+            "POST",
+            "/reader/api/0/stream/items/contents",
+            data={
+                "i": self._normalize_article_id(article_id),
+                "output": "json",
+            },
+        )
+        items = payload.get("items") or []
+        if not items:
+            raise FreshRSSError(f"未找到文章：{article_id}")
+        return self._parse_article(items[0])
 
-        r = self._get(f"?{params}")
-        articles = self._parse_articles(r.text)
+    def _edit_tag(self, article_id: str, *, add: Optional[str] = None, remove: Optional[str] = None) -> bool:
+        data = {
+            "i": self._normalize_article_id(article_id),
+            "T": self._get_edit_token(),
+        }
+        if add:
+            data["a"] = add
+        if remove:
+            data["r"] = remove
 
-        if unread_only:
-            articles = [a for a in articles if not a.is_read]
-
-        return articles[:count]
+        response = self._request("POST", "/reader/api/0/edit-tag", data=data)
+        return response.text.strip() == "OK"
 
     def mark_read(self, entry_id: str) -> bool:
-        """Mark an article as read."""
-        self._ensure_auth()
-        r = self._get(f"?c=entry&a=read&id={entry_id}&rid={self._rid}")
-        return r.status_code == 200
+        return self._edit_tag(entry_id, add=READ_TAG)
 
     def mark_unread(self, entry_id: str) -> bool:
-        """Mark an article as unread."""
-        self._ensure_auth()
-        r = self._get(f"?c=entry&a=unread&id={entry_id}&rid={self._rid}")
-        return r.status_code == 200
+        return self._edit_tag(entry_id, remove=READ_TAG)
 
     def toggle_star(self, entry_id: str) -> bool:
-        """Toggle star/bookmark on an article."""
-        self._ensure_auth()
-        r = self._get(f"?c=entry&a=bookmark&id={entry_id}&rid={self._rid}")
-        return r.status_code == 200
+        categories = self._get_item_categories(entry_id)
+        if STARRED_TAG in categories:
+            return self._edit_tag(entry_id, remove=STARRED_TAG)
+        return self._edit_tag(entry_id, add=STARRED_TAG)
 
-    def get_unread_counts(self) -> dict:
-        """Get unread count per feed."""
-        feeds = self.get_feeds()
-        return {f.name: f.unread_count for f in feeds}
+    def get_unread_counts(self) -> Dict[str, int]:
+        return {feed.name: feed.unread_count for feed in self.get_feeds()}

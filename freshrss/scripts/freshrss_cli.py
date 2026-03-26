@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FreshRSS CLI - command line interface for FreshRSS."""
+"""FreshRSS CLI。"""
 
 import argparse
 import os
@@ -8,25 +8,34 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env from script directory
 _script_dir = Path(__file__).resolve().parent
 load_dotenv(_script_dir / ".env")
 
-from web_client import FreshRSSWebClient, FreshRSSError, AuthenticationError
+from web_client import AuthenticationError, FreshRSSError, FreshRSSWebClient
 
 
 def get_client() -> FreshRSSWebClient:
     url = os.getenv("FRESHRSS_URL", "")
+    api_url = os.getenv("FRESHRSS_API_URL", "")
     user = os.getenv("FRESHRSS_USERNAME", "")
-    pwd = os.getenv("FRESHRSS_PASSWORD", "")
-    if not all([url, user, pwd]):
+    pwd = os.getenv("FRESHRSS_API_PASSWORD") or os.getenv("FRESHRSS_PASSWORD", "")
+
+    if not ((url or api_url) and user and pwd):
         print(
-            "Error: missing FRESHRSS_URL, FRESHRSS_USERNAME, or FRESHRSS_PASSWORD.\n"
+            "Error: missing FreshRSS API config.\n"
+            "Required: FRESHRSS_USERNAME and one of FRESHRSS_API_PASSWORD/FRESHRSS_PASSWORD,\n"
+            "plus one of FRESHRSS_API_URL/FRESHRSS_URL.\n"
             f"Please refer to setup guide: {_script_dir.parent / 'references' / 'setup.md'}",
             file=sys.stderr,
         )
         sys.exit(1)
-    client = FreshRSSWebClient(url, user, pwd)
+
+    client = FreshRSSWebClient(
+        base_url=url or api_url,
+        username=user,
+        password=pwd,
+        api_url=api_url or None,
+    )
     client.authenticate()
     return client
 
@@ -70,24 +79,16 @@ def cmd_get_articles(args):
 
 def cmd_get_content(args):
     client = get_client()
-    articles = client.get_articles(count=200)
-    for a in articles:
-        if a.id == args.article_id:
-            print(f"Title: {a.title}")
-            print(f"Feed: {a.feed_name}  Date: {a.date[:10] if a.date else ''}")
-            print(f"URL: {a.url}")
-            if a.authors:
-                print(f"Author: {a.authors}")
-            if a.tags:
-                print(f"Tags: {' '.join('#' + t for t in a.tags)}")
-            print()
-            print(a.content or a.summary or "(no content)")
-            return
-    print(
-        f"Article {args.article_id} not found (may be older than current page)",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+    article = client.get_article(args.article_id)
+    print(f"Title: {article.title}")
+    print(f"Feed: {article.feed_name}  Date: {article.date[:10] if article.date else ''}")
+    print(f"URL: {article.url}")
+    if article.authors:
+        print(f"Author: {article.authors}")
+    if article.tags:
+        print(f"Tags: {' '.join('#' + t for t in article.tags)}")
+    print()
+    print(article.content or article.summary or "(no content)")
 
 
 def cmd_mark_read(args):
@@ -123,10 +124,10 @@ def cmd_unread_count(args):
     feeds = client.get_feeds()
     total = 0
     print("Unread counts:\n")
-    for f in feeds:
-        if f.unread_count:
-            print(f"  {f.name}: {f.unread_count}")
-            total += f.unread_count
+    for feed in feeds:
+        if feed.unread_count:
+            print(f"  {feed.name}: {feed.unread_count}")
+            total += feed.unread_count
     print(f"\n  Total: {total} unread")
 
 
@@ -169,19 +170,19 @@ def main():
 
     try:
         handlers[args.command](args)
-    except AuthenticationError as e:
+    except AuthenticationError as exc:
         print(
-            f"Authentication error: {e}\n"
+            f"Authentication error: {exc}\n"
             f"Please check your credentials in: {_script_dir / '.env'}\n"
             f"Setup guide: {_script_dir.parent / 'references' / 'setup.md'}",
             file=sys.stderr,
         )
         sys.exit(1)
-    except FreshRSSError as e:
-        print(f"FreshRSS error: {e}", file=sys.stderr)
+    except FreshRSSError as exc:
+        print(f"FreshRSS error: {exc}", file=sys.stderr)
         sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
